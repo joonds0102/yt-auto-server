@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: yt-auto-server
+    runtime: python
+    buildCommand: "chmod +x build.sh && ./build.sh"
+    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 600 --workers 1"
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PEXELS_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: SPREADSHEET_ID
+        sync: false
+    plan: starter
+    region: oregon
