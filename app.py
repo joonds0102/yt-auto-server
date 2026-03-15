@@ -36,7 +36,6 @@ def tts(nar,sid):
   else:cu+=" "+s if cu else s
  if cu:chs.append(cu.strip())
  if not chs:chs=[cl[:3500]]
- L.info(f"TTS:{len(chs)} chunks")
  sil=AD/f"{sid}_sil.mp3"
  subprocess.run(["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=24000:cl=mono","-t","0.3","-q:a","9",str(sil)],capture_output=1,timeout=10)
  cf=AD/f"{sid}_lst.txt"
@@ -58,9 +57,8 @@ def tts(nar,sid):
  subprocess.run(["ffmpeg","-y","-i",str(raw),"-af","loudnorm=I=-16:TP=-1.5:LRA=11","-ar","24000","-ac","1",str(fn)],capture_output=1,timeout=60)
  for f in AD.glob(f"{sid}_c*.mp3"):f.unlink(missing_ok=1)
  for f in[sil,cf,raw]:Path(f).unlink(missing_ok=1)
- gc.collect();L.info(f"TTS done:{fn}");return fn
+ gc.collect();return fn
 def imgs(qs,sid):
- L.info(f"Imgs:{len(qs)}q")
  d=ID/sid;d.mkdir(exist_ok=1);dl=[]
  for i,q in enumerate(qs[:8]):
   try:
@@ -71,26 +69,22 @@ def imgs(qs,sid):
     rp=d/f"r{i}.jpg";rp.write_bytes(ir.content)
     rs=d/f"i{i:03d}.jpg"
     subprocess.run(["ffmpeg","-y","-i",str(rp),"-vf","scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720","-q:v","3",str(rs)],capture_output=1,timeout=15)
-    rp.unlink(missing_ok=1);dl.append(str(rs));L.info(f" img{i+1} ok")
-  except Exception as e:L.warning(f" img{i+1} fail:{e}")
+    rp.unlink(missing_ok=1);dl.append(str(rs))
+  except:pass
   time.sleep(0.2)
  while len(dl)<3:
   fb=d/f"fb{len(dl)}.jpg"
   subprocess.run(["ffmpeg","-y","-f","lavfi","-i","color=c=0x1a1a2e:s=1280x720:d=1","-frames:v","1","-q:v","3",str(fb)],capture_output=1,timeout=10)
   dl.append(str(fb))
- gc.collect();L.info(f"Imgs done:{len(dl)}");return dl
+ gc.collect();return dl
 def thb(bg,sid):
  o=TD/f"{sid}_t.jpg"
  if bg and os.path.exists(bg):
-  subprocess.run(["ffmpeg","-y","-i",bg,"-vf","scale=1280:720,colorbalance=bs=-0.3:bm=-0.3:bh=-0.3","-frames:v","1","-q:v","2",str(o)],capture_output=1,timeout=15)
+  subprocess.run(["ffmpeg","-y","-i",bg,"-vf","scale=1280:720","-frames:v","1","-q:v","2",str(o)],capture_output=1,timeout=15)
  else:
   subprocess.run(["ffmpeg","-y","-f","lavfi","-i","color=c=0x1a1a2e:s=1280x720:d=1","-frames:v","1","-q:v","2",str(o)],capture_output=1,timeout=10)
- L.info(f"Thumb done:{o}");return o
-def tc(s):
- h=int(s//3600);m=int((s%3600)//60);se=int(s%60);ms=int((s%1)*1000)
- return f"{h:02d}:{m:02d}:{se:02d},{ms:03d}"
-def vid(im,au,nar,sid):
- L.info("Vid start")
+ return o
+def vid(im,au,sid):
  dur=gad(str(au));cd=max(dur/len(im),3.0)
  zp={"zi":"zoompan=z='min(zoom+0.002,1.2)':d={}:s=1280x720:fps=24","zo":"zoompan=z='if(eq(on,1),1.2,max(zoom-0.002,1))':d={}:s=1280x720:fps=24"}
  cf=VD/f"{sid}_l.txt";cc=0
@@ -98,11 +92,10 @@ def vid(im,au,nar,sid):
   for i,img in enumerate(im):
    a=min(cd,dur-(i*cd))
    if a<=0:break
-   cl=VD/f"{sid}_c{i}.mp4"
-   ef=zp["zo" if i%2 else "zi"].format(int(a*24))
+   cl=VD/f"{sid}_c{i}.mp4";ef=zp["zo" if i%2 else "zi"].format(int(a*24))
    subprocess.run(["ffmpeg","-y","-loop","1","-i",img,"-vf",ef,"-t",str(a),"-c:v","libx264","-preset","ultrafast","-crf","28","-pix_fmt","yuv420p","-r","24","-threads","1",str(cl)],capture_output=1,timeout=120)
    if cl.exists() and cl.stat().st_size>0:
-    f.write(f"file '{cl}'\n");cc+=1;L.info(f" clip{i+1}/{len(im)} ok")
+    f.write(f"file '{cl}'\n");cc+=1
    gc.collect()
  if cc==0:raise Exception("no clips")
  rv=VD/f"{sid}_r.mp4"
@@ -120,6 +113,33 @@ def vid(im,au,nar,sid):
  gc.collect()
  sz=fn.stat().st_size/(1024*1024) if fn.exists() else 0
  L.info(f"Vid done:{fn} ({sz:.1f}MB)");return fn
+# === YouTube OAuth ===
+CID=os.getenv("YT_CLIENT_ID","")
+CSC=os.getenv("YT_CLIENT_SECRET","")
+RDU=os.getenv("YT_REDIRECT_URI","https://yt-auto-server.onrender.com/oauth/callback")
+TKF=Path("/tmp/yt_token.json")
+def yt_creds():
+ if not TKF.exists():return None
+ tk=json.loads(TKF.read_text())
+ if tk.get("expires_at",0)<time.time():
+  r=requests.post("https://oauth2.googleapis.com/token",data={"client_id":CID,"client_secret":CSC,"refresh_token":tk["refresh_token"],"grant_type":"refresh_token"})
+  if r.status_code==200:
+   d=r.json();tk["access_token"]=d["access_token"];tk["expires_at"]=time.time()+d.get("expires_in",3600)-60
+   TKF.write_text(json.dumps(tk))
+ return tk
+def yt_upload(vp,ti,desc,tags):
+ tk=yt_creds()
+ if not tk:L.warning("No YT token");return None
+ meta={"snippet":{"title":ti[:100],"description":desc[:5000],"tags":tags[:30],"categoryId":"22","defaultLanguage":"ko"},"status":{"privacyStatus":"public","selfDeclaredMadeForKids":False}}
+ r=requests.post("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",headers={"Authorization":f"Bearer {tk['access_token']}","Content-Type":"application/json"},json=meta,timeout=30)
+ if r.status_code!=200:L.error(f"YT init:{r.status_code}");return None
+ uurl=r.headers.get("Location")
+ if not uurl:return None
+ with open(vp,'rb') as f:
+  r2=requests.put(uurl,headers={"Content-Type":"video/mp4"},data=f,timeout=600)
+ if r2.status_code in(200,201):
+  vid=r2.json().get("id","");L.info(f"YT ok:{vid}");return vid
+ L.error(f"YT fail:{r2.status_code}");return None
 def pipe(sj):
  sid=datetime.now().strftime("%Y%m%d_%H%M%S")
  for d in[AD,ID,VD,TD]:cld(d)
@@ -128,33 +148,53 @@ def pipe(sj):
   ti=sj.get("title","");na=sj.get("narration","")
   tt=sj.get("thumbnail_text",ti);iq=sj.get("image_queries",["Korea","Seoul"])
   ntf(f"📝 {ti}")
-  au=tts(na,sid);ntf("🎙️ TTS done")
-  im=imgs(iq,sid);ntf(f"🖼️ {len(im)} imgs")
+  au=tts(na,sid);ntf("🎙 TTS done")
+  im=imgs(iq,sid);ntf(f"🖼 {len(im)} imgs")
   th=thb(im[0] if im else "",sid);ntf("🎨 thumb")
-  vd=vid(im,au,na,sid)
+  vd=vid(im,au,sid)
   sz=vd.stat().st_size/(1024*1024) if vd.exists() else 0
   ntf(f"✅ <b>Done!</b>\n{ti}\n{sz:.1f}MB")
-  return {"status":"success","title":ti,"video":str(vd),"size_mb":round(sz,1)}
+  yid=yt_upload(str(vd),ti,sj.get("description",""),sj.get("tags",[]))
+  if yid:ntf(f"📺 <b>YouTube!</b>^nhttps://youtu.be/{yid}")
+  else:ntf("⚠️ YT upload skipped (no OAuth)")
+  return {"status":"success","title":ti,"video":str(vd),"size_mb":round(sz,1),"youtube_id":yid}
  except Exception as e:
   L.error(f"Err:{e}",exc_info=1);ntf(f"❌ <b>Error</b>\n{str(e)[:200]}")
   return {"status":"error","error":str(e)}
-@app.route("/",methods=["GET"])
-def home():return jsonify({"service":"yt-auto v2","status":"running","busy":PS["running"]})
-@app.route("/health",methods=["GET"])
+@app.route("/")
+def home():return jsonify({"service":"yt-auto v3","status":"running","busy":PS["running"]})
+@app.route("/health")
 def health():return jsonify({"status":"ok","ts":datetime.now().isoformat()})
 @app.route("/trigger",methods=["POST"])
 def trigger():
  if PS["running"]:return jsonify({"status":"busy"}),429
  d=request.json or {};s=d.get("script",d)
- t=threading.Thread(target=_r,args=(s,));t.start()
+ threading.Thread(target=_r,args=(s,)).start()
  return jsonify({"status":"started","ts":datetime.now().isoformat()})
-@app.route("/status",methods=["GET"])
+@app.route("/status")
 def status():return jsonify(PS)
+@app.route("/oauth/start")
+def oauth_start():
+ u=f"https://accounts.google.com/o/oauth2/v2/auth?client_id={CID}&redirect_uri={RDU}&response_type=code&scope=https://www.googleapis.com/auth/youtube.upload&access_type=offline&prompt=consent"
+ return f'<h2>YouTube OAuth</h2><a href="{u}" style="font-size:24px">Google Login</a>'
+@app.route("/oauth/callback")
+def oauth_cb():
+ code=request.args.get("code")
+ if not code:return "no code",400
+ r=requests.post("https://oauth2.googleapis.com/token",data={"code":code,"client_id":CID,"client_secret":CSC,"redirect_uri":RDU,"grant_type":"authorization_code"})
+ if r.status_code!=200:return f"error:{r.text}",400
+ d=r.json();d["expires_at"]=time.time()+d.get("expires_in",3600)-60
+ TKF.write_text(json.dumps(d));ntf("🔑 YouTube OAuth done!")
+ return "<h2>Success! YouTube connected.</h2>"
+@app.route("/oauth/status")
+def oauth_st():
+ if TKF.exists():return jsonify({"status":"connected"})
+ return jsonify({"status":"not_connected"})
 def _r(s):
  PS["running"]=True;PS["lr"]=datetime.now().isoformat()
  try:PS["res"]=pipe(s)
  except Exception as e:PS["res"]={"status":"error","error":str(e)}
  finally:PS["running"]=False
 if __name__=="__main__":
- p=int(os.getenv("PORT",10000));L.info(f"🎬 v2:{p}")
+ p=int(os.getenv("PORT",10000));L.info(f"🎬 v3:{p}")
  app.run(host="0.0.0.0",port=p)
