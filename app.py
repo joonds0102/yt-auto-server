@@ -1,507 +1,144 @@
 #!/usr/bin/env python3
-"""
-ğŸ¬ êµ­ë½•ìœ íŠœë¸Œ ìë™í™” ì„œë²„ (Render.com ë°°í¬ìš©)
-================================================
-Make.comì—ì„œ íŠ¸ë¦¬ê±° â†’ TTS ìƒì„± â†’ ì˜ìƒ í¸ì§‘ â†’ YouTube ì—…ë¡œë“œ
-
-í™˜ê²½ë³€ìˆ˜ (Render.com Dashboardì—ì„œ ì„¤ì •):
-    OPENAI_API_KEY=sk-...
-    PEXELS_API_KEY=...
-    TELEGRAM_BOT_TOKEN=...
-    TELEGRAM_CHAT_ID=...
-    SPREADSHEET_ID=1AlUxmqMcAt_CqW3MSiQ1eVav5XLG_wj9CEyJ-DLqH-Y
-"""
-
-import os
-import json
-import time
-import re
-import logging
-import subprocess
-import threading
+import os,json,time,re,gc,logging,subprocess,threading
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask,request,jsonify
 import requests
+app=Flask(__name__)
+BD=Path("/tmp/yt");AD=BD/"a";ID=BD/"i";VD=BD/"v";TD=BD/"t"
+for d in[AD,ID,VD,TD]:d.mkdir(parents=True,exist_ok=True)
+logging.basicConfig(level=logging.INFO,format='%(asctime)s [%(levelname)s] %(message)s')
+L=logging.getLogger(__name__)
+OK=os.getenv("OPENAI_API_KEY","");PK=os.getenv("PEXELS_API_KEY","")
+TT=os.getenv("TELEGRAM_BOT_TOKEN","");TC=os.getenv("TELEGRAM_CHAT_ID","")
+PS={"running":False,"last_run":None,"last_result":None}
 
-# ============================================================
-# ì„¤ì •
-# ============================================================
-app = Flask(__name__)
+def notify(m):
+    L.info(f"[N] {m}")
+    if TT and TC:
+        try:requests.post(f"https://api.telegram.org/bot{TT}/sendMessage",json={"chat_id":TC,"text":m,"parse_mode":"HTML"},timeout=10)
+        except Exception as e:L.warning(f"TG fail:{e}")
 
-BASE_DIR = Path("/tmp/yt_auto")
-AUDIO_DIR = BASE_DIR / "audio"
-IMAGE_DIR = BASE_DIR / "images"
-VIDEO_DIR = BASE_DIR / "video"
-THUMB_DIR = BASE_DIR / "thumbnails"
+def clean(d):
+    for f in Path(d).glob("*"):
+        if f.is_file():f.unlink(missing_ok=True)
+    gc.collect()
 
-for d in [AUDIO_DIR, IMAGE_DIR, VIDEO_DIR, THUMB_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
+def adur(p):
+    r=subprocess.run(["ffprobe","-v","quiet","-show_entries","format=duration","-of","csv=p=0",str(p)],capture_output=True,text=True)
+    try:return float(r.stdout.strip())
+    except:return 60.0
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
+def tts(nar,sid):
+    L.info("TTS start")
+    c=re.sub(r'\[IMAGE:.*?\]','',nar).strip() or "test"
+    ss=[s.strip() for s in re.split(r'(?<=[.!?])\s+',c) if s.strip()]
+    cks,cu=[],""
+    for s in ss:
+        if len(cu)+len(s)+1>3500:
+            if cu:cks.append(cu.strip())
+            cu=s
+        else:cu+=" "+s if cu else s
+    if cu:cks.append(cu.strip())
+    if not cks:cks=[c[:3500]]
+    L.info(f"TTS:{len(cks)} chunks")
+    sl=AD/f"{sid}_sl.mp3"
+    subprocess.run(["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=24000:cl=mono","-t","0.3","-q:a","9",str(sl)],capture_output=True,timeout=10)
+    cf=AD/f"{sid}_l.txt";hd={"Authorization":f"Bearer {OK}","Content-Type":"application/json"}
+    with open(cf,'w') as f:
+        for i,ch in enumerate(cks):
+            cp=AD/f"{sid}_c{i}.mp3"
+            try:
+                r=requests.post("https://api.openai.com/v1/audio/speech",headers=hd,json={"model":"tts-1","input":ch,"voice":"onyx","speed":0.92,"response_format":"mp3"},timeout=120)
+                r.raise_for_status();cp.write_bytes(r.content)
+                f.write(f"file '{cp}'\n")
+                if i<len(cks)-1:f.write(f"file '{sl}'\n")
+                L.info(f"  c{i+1}/{len(cks)} ok")
+            except Exception as e:L.error(f"  c{i+1} fail:{e}")
+            time.sleep(0.3)
+    raw=AD/f"{sid}_r.mp3"
+    subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i",str(cf),"-c","copy",str(raw)],capture_output=True,timeout=60)
+    fn=AD/f"{sid}_f.mp3"
+    subprocess.run(["ffmpeg","-y","-i",str(raw),"-af","loudnorm=I=-16:TP=-1.5:LRA=11","-ar","24000","-ac","1",str(fn)],capture_output=True,timeout=60)
+    for f in AD.glob(f"{sid}_c*.mp3"):f.unlink(missing_ok=True)
+    for f in[sl,cf,raw]:Path(f).unlink(missing_ok=True)
+    gc.collect();L.info(f"TTS done:{fn}");return fn
 
-# í™˜ê²½ë³€ìˆ˜
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
-PEXELS_KEY = os.getenv("PEXELS_API_KEY", "")
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-SHEET_ID = os.getenv("SPREADSHEET_ID", "1AlUxmqMcAt_CqW3MSiQ1eVav5XLG_wj9CEyJ-DLqH-Y")
-
-pipeline_status = {"running": False, "last_run": None, "last_result": None}
-
-
-# ============================================================
-# ìœ í‹¸ë¦¬í‹°
-# ============================================================
-def notify(msg):
-    """Telegram ì•Œë¦¼"""
-    if TG_TOKEN and TG_CHAT:
+def imgs(qs,sid):
+    L.info(f"Imgs:{len(qs)}q")
+    d=ID/sid;d.mkdir(exist_ok=True);dl=[]
+    for i,q in enumerate(qs[:10]):
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
-                timeout=10
-            )
-        except:
-            pass
-    logger.info(f"[ì•Œë¦¼] {msg}")
+            r=requests.get("https://api.pexels.com/v1/search",headers={"Authorization":PK},params={"query":q,"per_page":1,"orientation":"landscape","size":"medium"},timeout=10)
+            r.raise_for_status();ph=r.json().get("photos",[])
+            if ph:
+                ir=requests.get(ph[0]["src"]["large"],timeout=20)
+                rp=d/f"r{i}.jpg";rp.write_bytes(ir.content)
+                rs=d/f"i{i:03d}.jpg"
+                subprocess.run(["ffmpeg","-y","-i",str(rp),"-vf","scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720","-q:v","3",str(rs)],capture_output=True,timeout=15)
+                rp.unlink(missing_ok=True);dl.append(str(rs));L.info(f"  i{i+1}:{q[:15]} ok")
+        except Exception as e:L.warning(f"  i{i+1} fail:{e}")
+        time.sleep(0.2)
+    while len(dl)<3:
+        fb=d/f"fb{len(dl)}.jpg"
+        subprocess.run(["ffmpeg","-y","-f","lavfi","-i","color=c=0x1a1a2e:s=1280x720:d=1","-frames:v","1","-q:v","3",str(fb)],capture_output=True,timeout=10)
+        dl.append(str(fb))
+    gc.collect();L.info(f"Imgs done:{len(dl)}");return dl
 
+def thumb(txt,bg,sid):
+    o=TD/f"{sid}_t.jpg"
+    if bg and os.path.exists(bg):
+        subprocess.run(["ffmpeg","-y","-i",bg,"-vf","scale=1280:720,colorbalance=bs=-0.3:bm=-0.3:bh=-0.3","-frames:v","1","-q:v","2",str(o)],capture_output=True,timeout=15)
+    else:
+        subprocess.run(["ffmpeg","-y","-f","lavfi","-i","color=c=0x1a1a2e:s=1280x720:d=1","-frames:v","1","-q:v","2",str(o)],capture_output=True,timeout=10)
+    L.info(f"Thumb:{o}");return o
 
-def openai_request(endpoint, payload, timeout=120):
-    """OpenAI API í˜¸ì¶œ í—¬í¼"""
-    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
-    resp = requests.post(f"https://api.openai.com/v1/{endpoint}", headers=headers, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+def tc(s):
+    h=int(s//3600);m=int((s%3600)//60);se=int(s%60);ms=int((s%1)*1000)
+    return f"{h:02d}:{m:02d}:{se:02d},{ms:03d}"
 
-
-# ============================================================
-# ëª¨ë“ˆ 1: TTS ìŒì„± ìƒì„±
-# ============================================================
-def generate_tts(narration: str, session_id: str) -> Path:
-    """OpenAI TTSë¡œ ë‚˜ë ˆì´ì…˜ ìŒì„± ìƒì„±"""
-    logger.info("TTS ìƒì„± ì‹œì‘...")
-
-    # ì´ë¯¸ì§€ ë§ˆì»¤ ì œê±°
-    clean_text = re.sub(r'\[IMAGE:.*?\]', '', narration).strip()
-    if not clean_text:
-        clean_text = "ëŒ€í•œë¯¼êµ­ì˜ ë†€ë¼ìš´ ì´ì•¼ê¸°ë¥¼ ì‹œì‘í•©ë‹ˆë‹¤."
-
-    # í…ìŠ¤íŠ¸ ë¶„í•  (4000ì ì œí•œ)
-    chunks = []
-    sentences = re.split(r'(?<=[.!?])\s+', clean_text)
-    current = ""
-    for s in sentences:
-        if len(current) + len(s) + 1 > 3800:
-            if current:
-                chunks.append(current.strip())
-            current = s
-        else:
-            current += " " + s if current else s
-    if current:
-        chunks.append(current.strip())
-
-    if not chunks:
-        chunks = [clean_text[:3800]]
-
-    logger.info(f"TTS: {len(chunks)}ê°œ ì²­í¬")
-
-    # ê° ì²­í¬ TTS ìƒì„±
-    chunk_files = []
-    for i, chunk in enumerate(chunks):
-        chunk_path = AUDIO_DIR / f"{session_id}_chunk_{i:03d}.mp3"
-        resp = openai_request("audio/speech", {
-            "model": "tts-1-hd",
-            "input": chunk,
-            "voice": "onyx",
-            "speed": 0.92,
-            "response_format": "mp3"
-        })
-        chunk_path.write_bytes(resp.content)
-        chunk_files.append(chunk_path)
-        logger.info(f"  ì²­í¬ {i+1}/{len(chunks)} ì™„ë£Œ")
-        time.sleep(0.5)
-
-    # ë¬´ìŒ ìƒì„±
-    silence = AUDIO_DIR / f"{session_id}_silence.mp3"
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
-        "-t", "0.4", "-q:a", "9", str(silence)
-    ], capture_output=True)
-
-    # í•©ì¹˜ê¸°
-    concat_file = AUDIO_DIR / f"{session_id}_concat.txt"
-    with open(concat_file, 'w') as f:
-        for i, cf in enumerate(chunk_files):
-            f.write(f"file '{cf}'\n")
-            if i < len(chunk_files) - 1:
-                f.write(f"file '{silence}'\n")
-
-    raw_audio = AUDIO_DIR / f"{session_id}_raw.mp3"
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(concat_file), "-c", "copy", str(raw_audio)
-    ], capture_output=True)
-
-    # ìŒëŸ‰ ì •ê·œí™”
-    final_audio = AUDIO_DIR / f"{session_id}_final.mp3"
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(raw_audio),
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-        str(final_audio)
-    ], capture_output=True)
-
-    # ì •ë¦¬
-    for f in chunk_files:
-        f.unlink(missing_ok=True)
-    silence.unlink(missing_ok=True)
-    concat_file.unlink(missing_ok=True)
-    raw_audio.unlink(missing_ok=True)
-
-    logger.info(f"TTS ì™„ë£Œ: {final_audio}")
-    return final_audio
-
-
-# ============================================================
-# ëª¨ë“ˆ 2: ì´ë¯¸ì§€ ìˆ˜ì§‘
-# ============================================================
-def collect_images(image_queries: list, session_id: str) -> list:
-    """Pexels APIë¡œ ì´ë¯¸ì§€ ìˆ˜ì§‘"""
-    logger.info(f"ì´ë¯¸ì§€ ìˆ˜ì§‘ ì‹œì‘: {len(image_queries)}ê°œ ì¿¼ë¦¬")
-
-    session_dir = IMAGE_DIR / session_id
-    session_dir.mkdir(exist_ok=True)
-    downloaded = []
-
-    for i, query in enumerate(image_queries[:25]):
-        try:
-            resp = requests.get(
-                "https://api.pexels.com/v1/search",
-                headers={"Authorization": PEXELS_KEY},
-                params={"query": query, "per_page": 1, "orientation": "landscape", "size": "large"},
-                timeout=10
-            )
-            resp.raise_for_status()
-            photos = resp.json().get("photos", [])
-
-            if photos:
-                img_url = photos[0]["src"]["large2x"]
-                img_resp = requests.get(img_url, timeout=30)
-                img_path = session_dir / f"img_{i:03d}.jpg"
-                img_path.write_bytes(img_resp.content)
-                downloaded.append(str(img_path))
-                logger.info(f"  ì´ë¯¸ì§€ {i+1}: {query[:25]}... âœ“")
-            else:
-                logger.warning(f"  ì´ë¯¸ì§€ {i+1}: {query[:25]}... ê²°ê³¼ì—†ìŒ")
-        except Exception as e:
-            logger.warning(f"  ì´ë¯¸ì§€ {i+1} ì‹¤íŒ¨: {e}")
-        time.sleep(0.3)
-
-    # ìµœì†Œ 5ê°œ ì´ë¯¸ì§€ ë³´ì¥ (ê¸°ë³¸ ì´ë¯¸ì§€ ìƒì„±)
-    while len(downloaded) < 5:
-        fallback = session_dir / f"img_fallback_{len(downloaded):03d}.jpg"
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi", "-i",
-            f"color=c=0x1a1a2e:s=1920x1080:d=1",
-            "-frames:v", "1", str(fallback)
-        ], capture_output=True)
-        downloaded.append(str(fallback))
-
-    logger.info(f"ì´ë¯¸ì§€ ìˆ˜ì§‘ ì™„ë£Œ: {len(downloaded)}ê°œ")
-    return downloaded
-
-
-# ============================================================
-# ëª¨ë“ˆ 3: ì¸ë„¤ì¼ ìƒì„±
-# ============================================================
-def generate_thumbnail(thumbnail_text: str, bg_image: str, session_id: str) -> Path:
-    """FFmpegë¡œ ì¸ë„¤ì¼ ìƒì„±"""
-    output = THUMB_DIR / f"{session_id}_thumb.jpg"
-
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-
-        if bg_image and os.path.exists(bg_image):
-            bg = Image.open(bg_image).resize((1280, 720), Image.LANCZOS).convert('RGBA')
-        else:
-            bg = Image.new('RGBA', (1280, 720), (26, 26, 46, 255))
-
-        # ì–´ë‘ìš´ ì˜¤ë²„ë ˆì´
-        overlay = Image.new('RGBA', (1280, 720), (0, 0, 0, 150))
-        bg = Image.alpha_composite(bg, overlay)
-        draw = ImageDraw.Draw(bg)
-
-        # í°íŠ¸ ì°¾ê¸°
-        font_paths = [
-            "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ]
-        font_path = next((p for p in font_paths if os.path.exists(p)), None)
-        font = ImageFont.truetype(font_path, 64) if font_path else ImageFont.load_default()
-
-        # í…ìŠ¤íŠ¸ ë Œë”ë§
-        lines = thumbnail_text.split('\n') if '\n' in thumbnail_text else [thumbnail_text]
-        y = 250
-        for line in lines[:2]:
-            bbox = draw.textbbox((0, 0), line, font=font)
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
-            x = (1280 - tw) // 2
-            draw.rectangle([x-12, y-8, x+tw+12, y+th+8], fill='#FF0000')
-            draw.text((x, y), line, fill='white', font=font)
-            y += th + 30
-
-        bg.convert('RGB').save(str(output), "JPEG", quality=95)
-    except ImportError:
-        # Pillow ì—†ìœ¼ë©´ FFmpeg fallback
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi", "-i",
-            "color=c=0x1a1a2e:s=1280x720:d=1",
-            "-frames:v", "1", str(output)
-        ], capture_output=True)
-
-    logger.info(f"ì¸ë„¤ì¼ ìƒì„± ì™„ë£Œ: {output}")
-    return output
-
-
-# ============================================================
-# ëª¨ë“ˆ 4: ì˜ìƒ í¸ì§‘ (FFmpeg)
-# ============================================================
-def compose_video(images: list, audio_path: Path, narration: str, session_id: str) -> Path:
-    """FFmpegë¡œ ì´ë¯¸ì§€ + ì˜¤ë””ì˜¤ â†’ ì˜ìƒ í•©ì„±"""
-    logger.info("ì˜ìƒ í¸ì§‘ ì‹œì‘...")
-
-    # ì˜¤ë””ì˜¤ ê¸¸ì´
-    result = subprocess.run([
-        "ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-        "-of", "csv=p=0", str(audio_path)
-    ], capture_output=True, text=True)
-    audio_duration = float(result.stdout.strip()) if result.stdout.strip() else 300
-
-    # í´ë¦½ ìƒì„±
-    clip_duration = max(audio_duration / len(images), 3.0)
-    effects = ["zoom_in", "zoom_out", "pan_right", "pan_left"]
-    zoompan_map = {
-        "zoom_in": "zoompan=z='min(zoom+0.0015,1.3)':d={dur}:s=1920x1080:fps=30",
-        "zoom_out": "zoompan=z='if(eq(on,1),1.3,max(zoom-0.0015,1))':d={dur}:s=1920x1080:fps=30",
-        "pan_right": "zoompan=z='1.2':x='if(eq(on,1),0,min(x+2,iw-iw/zoom))':d={dur}:s=1920x1080:fps=30",
-        "pan_left": "zoompan=z='1.2':x='if(eq(on,1),iw,max(x-2,0))':d={dur}:s=1920x1080:fps=30",
-    }
-
-    clip_files = []
-    for i, img in enumerate(images):
-        actual_dur = min(clip_duration, audio_duration - (i * clip_duration))
-        if actual_dur <= 0:
-            break
-
-        clip = VIDEO_DIR / f"{session_id}_clip_{i:03d}.mp4"
-        effect = effects[i % 4]
-        dur_frames = int(actual_dur * 30)
-        zp = zoompan_map[effect].format(dur=dur_frames)
-
-        subprocess.run([
-            "ffmpeg", "-y", "-loop", "1", "-i", img,
-            "-vf", f"scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,{zp}",
-            "-t", str(actual_dur), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-            str(clip)
-        ], capture_output=True)
-        clip_files.append(clip)
-        logger.info(f"  í´ë¦½ {i+1}/{len(images)} ({effect})")
-
-    # í´ë¦½ ì´ì–´ë¶™ì´ê¸°
-    concat_list = VIDEO_DIR / f"{session_id}_concat.txt"
-    with open(concat_list, 'w') as f:
-        for cf in clip_files:
-            f.write(f"file '{cf}'\n")
-
-    raw_video = VIDEO_DIR / f"{session_id}_raw.mp4"
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(concat_list), "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        str(raw_video)
-    ], capture_output=True)
-
-    # SRT ìë§‰ ìƒì„±
-    srt_path = VIDEO_DIR / f"{session_id}_subs.srt"
-    clean_narr = re.sub(r'\[IMAGE:.*?\]', '', narration).strip()
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', clean_narr) if s.strip()]
-    total_chars = max(sum(len(s) for s in sentences), 1)
-    cur_time = 0.0
-
-    with open(srt_path, 'w', encoding='utf-8') as f:
-        for idx, sent in enumerate(sentences):
-            dur = max((len(sent) / total_chars) * audio_duration, 1.0)
-            start = cur_time
-            end = min(cur_time + dur, audio_duration)
-            sh, sm, ss, sms = int(start//3600), int((start%3600)//60), int(start%60), int((start%1)*1000)
-            eh, em, es, ems = int(end//3600), int((end%3600)//60), int(end%60), int((end%1)*1000)
-
-            display = sent
-            if len(sent) > 30:
-                mid = sent.find(' ', len(sent)//2)
-                if mid > 0:
-                    display = sent[:mid] + '\n' + sent[mid+1:]
-
-            f.write(f"{idx+1}\n")
-            f.write(f"{sh:02d}:{sm:02d}:{ss:02d},{sms:03d} --> {eh:02d}:{em:02d}:{es:02d},{ems:03d}\n")
-            f.write(f"{display}\n\n")
-            cur_time = end
-
-    # BGM ìƒì„±
-    bgm = AUDIO_DIR / f"{session_id}_bgm.mp3"
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "lavfi", "-i",
-        f"sine=frequency=220:sample_rate=44100:duration={audio_duration},"
-        f"tremolo=f=0.5:d=0.7,lowpass=f=300,volume=0.03",
-        "-t", str(audio_duration), str(bgm)
-    ], capture_output=True)
-
-    # ì˜¤ë””ì˜¤ ë¯¹ì‹±
-    mixed = AUDIO_DIR / f"{session_id}_mixed.mp3"
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(audio_path), "-i", str(bgm),
-        "-filter_complex", "[1]volume=0.08[bg];[0][bg]amix=inputs=2:duration=first:dropout_transition=3",
-        str(mixed)
-    ], capture_output=True)
-
-    # ìµœì¢… í•©ì„±
-    final = VIDEO_DIR / f"{session_id}_final.mp4"
-    sub_style = "FontSize=22,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=1,Alignment=2,MarginV=40"
-
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(raw_video), "-i", str(mixed),
-        "-vf", f"subtitles={srt_path}:force_style='{sub_style}'",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-        "-c:a", "aac", "-b:a", "192k",
-        "-shortest", "-movflags", "+faststart",
-        str(final)
-    ], capture_output=True)
-
-    # ì •ë¦¬
-    for cf in clip_files:
-        cf.unlink(missing_ok=True)
-    concat_list.unlink(missing_ok=True)
-    raw_video.unlink(missing_ok=True)
+def video(im,aud,nar,sid):
+    L.info("Vid start")
+    dur=adur(str(aud));cd=max(dur/len(im),3.0)
+    zp={"zi":"zoompan=z='min(zoom+0.002,1.2)':d={}:s=1280x720:fps=24","zo":"zoompan=z='if(eq(on,1),1.2,max(zoom-0.002,1))':d={}:s=1280x720:fps=24"}
+    cf=VD/f"{sid}_l.txt";cc=0
+    with open(cf,'w') as f:
+        for i,img in enumerate(im):
+            a=min(cd,dur-(i*cd))
+            if a<=0:break
+            cl=VD/f"{sid}_c{i}.mp4";ef=zp["zo" if i%2 else "zi"].format(int(a*24))
+            subprocess.run(["ffmpeg","-y","-loop","1","-i",img,"-vf",ef,"-t",str(a),"-c:v","libx264","-preset","ultrafast","-crf","28","-pix_fmt","yuv420p","-r","24","-threads","1",str(cl)],capture_output=True,timeout=120)
+            if cl.exists() and cl.stat().st_size>0:
+                f.write(f"file '{cl}'\n");cc+=1;L.info(f"  cl{i+1}/{len(im)} ok")
+            gc.collect()
+    if cc==0:raise Exception("no clips")
+    rv=VD/f"{sid}_r.mp4"
+    subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i",str(cf),"-c:v","libx264","-preset","ultrafast","-crf","28","-pix_fmt","yuv420p",str(rv)],capture_output=True,timeout=120)
+    for f in VD.glob(f"{sid}_c*.mp4"):f.unlink(missing_ok=True)
+    gc.collect()
+    bgm=AD/f"{sid}_bg.mp3"
+    subprocess.run(["ffmpeg","-y","-f","lavfi","-i",f"sine=f=180:r=24000:d={dur},tremolo=f=0.3:d=0.5,lowpass=f=250,volume=0.02","-t",str(dur),"-ar","24000","-ac","1",str(bgm)],capture_output=True,timeout=30)
+    mx=AD/f"{sid}_mx.mp3"
+    subprocess.run(["ffmpeg","-y","-i",str(aud),"-i",str(bgm),"-filter_complex","[1]volume=0.06[bg];[0][bg]amix=inputs=2:duration=first","-ar","24000","-ac","1",str(mx)],capture_output=True,timeout=60)
     bgm.unlink(missing_ok=True)
-    mixed.unlink(missing_ok=True)
+    fn=VD/f"{sid}_f.mp4"
+    subprocess.run(["ffmpeg","-y","-i",str(rv),"-i",str(mx),"-c:v","libx264","-preset","ultrafast","-crf","28","-c:a","aac","-b:a","128k","-ar","24000","-shortest","-movflags","+faststart","-threads","1",str(fn)],capture_output=True,timeout=180)
+    for f in[rv,mx,cf]:Path(f).unlink(missing_ok=True)
+    gc.collect()
+    sz=fn.stat().st_size/(1024*1024) if fn.exists() else 0
+    L.info(f"Vid done:{fn} ({sz:.1f}MB)");return fn
 
-    size_mb = final.stat().st_size / (1024*1024) if final.exists() else 0
-    logger.info(f"ì˜ìƒ ì™„ì„±: {final} ({size_mb:.1f}MB)")
-    return final
-
-
-# ============================================================
-# ì „ì²´ íŒŒì´í”„ë¼ì¸
-# ============================================================
-def run_pipeline(script_json: dict):
-    """Make.comì—ì„œ ë°›ì€ ëŒ€ë³¸ JSONìœ¼ë¡œ ì „ì²´ íŒŒì´í”„ë¼ì¸ ì‹¤í–‰"""
-    session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    notify("ğŸ¬ <b>íŒŒì´í”„ë¼ì¸ ì‹œì‘</b>")
-
+def pipeline(sj):
+    sid=datetime.now().strftime("%Y%m%d_%H%M%S")
+    for d in[AD,ID,VD,TD]:clean(d)
+    notify("ğŸ¬ <b>Start</b>")
     try:
-        title = script_json.get("title", "ì œëª©ì—†ìŒ")
-        narration = script_json.get("narration", "")
-        thumbnail_text = script_json.get("thumbnail_text", title)
-        image_queries = script_json.get("image_queries", [])
-        tags = script_json.get("tags", [])
-
-        notify(f"ğŸ“ ì œëª©: {title}")
-
-        # 1. TTS
-        audio_path = generate_tts(narration, session_id)
-        notify("ğŸ™ï¸ TTS ì™„ë£Œ")
-
-        # 2. ì´ë¯¸ì§€ ìˆ˜ì§‘
-        images = collect_images(image_queries, session_id)
-        notify(f"ğŸ–¼ï¸ ì´ë¯¸ì§€ {len(images)}ê°œ ìˆ˜ì§‘")
-
-        # 3. ì¸ë„¤ì¼
-        thumb_path = generate_thumbnail(thumbnail_text, images[0] if images else "", session_id)
-        notify("ğŸ¨ ì¸ë„¤ì¼ ì™„ë£Œ")
-
-        # 4. ì˜ìƒ í¸ì§‘
-        video_path = compose_video(images, audio_path, narration, session_id)
-        notify("ğŸ¬ ì˜ìƒ í¸ì§‘ ì™„ë£Œ")
-
-        # 5. YouTube ì—…ë¡œë“œ (OAuth ì„¤ì • í›„ í™œì„±í™”)
-        # upload_result = upload_to_youtube(video_path, thumb_path, script_json)
-
-        notify(
-            f"âœ… <b>íŒŒì´í”„ë¼ì¸ ì™„ë£Œ!</b>\n"
-            f"ì œëª©: {title}\n"
-            f"ì˜ìƒ: {video_path}\n"
-            f"ì„¸ì…˜: {session_id}"
-        )
-
-        return {
-            "status": "success",
-            "session_id": session_id,
-            "title": title,
-            "video_path": str(video_path),
-            "thumbnail_path": str(thumb_path),
-        }
-
-    except Exception as e:
-        logger.error(f"íŒŒì´í”„ë¼ì¸ ì˜¤ë¥˜: {e}", exc_info=True)
-        notify(f"âŒ <b>ì˜¤ë¥˜</b>\n{str(e)[:200]}")
-        return {"status": "error", "error": str(e)}
-
-
-# ============================================================
-# Flask ì—”ë“œí¬ì¸íŠ¸
-# ============================================================
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "service": "êµ­ë½•ìœ íŠœë¸Œ ìë™í™” ì„œë²„",
-        "status": "running",
-        "pipeline_running": pipeline_status["running"],
-        "last_run": pipeline_status["last_run"]
-    })
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
-
-
-@app.route("/trigger", methods=["POST"])
-def trigger():
-    """Make.comì—ì„œ í˜¸ì¶œ â€” ëŒ€ë³¸ JSONì„ ë°›ì•„ íŒŒì´í”„ë¼ì¸ ì‹¤í–‰"""
-    if pipeline_status["running"]:
-        return jsonify({"status": "busy", "message": "ì´ë¯¸ ì‹¤í–‰ ì¤‘"}), 429
-
-    data = request.json or {}
-    script_json = data.get("script", data)
-
-    thread = threading.Thread(target=_run_async, args=(script_json,))
-    thread.start()
-
-    return jsonify({"status": "started", "timestamp": datetime.now().isoformat()})
-
-
-@app.route("/status", methods=["GET"])
-def status():
-    return jsonify(pipeline_status)
-
-
-def _run_async(script_json):
-    pipeline_status["running"] = True
-    pipeline_status["last_run"] = datetime.now().isoformat()
-    try:
-        result = run_pipeline(script_json)
-        pipeline_status["last_result"] = result
-    except Exception as e:
-        pipeline_status["last_result"] = {"status": "error", "error": str(e)}
-    finally:
-        pipeline_status["running"] = False
-
-
-# ============================================================
-# ì‹¤í–‰
-# ============================================================
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    logger.info(f"ğŸ¬ ì„œë²„ ì‹œì‘: http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port)
+        ti=sj.get("title","");na=sj.get("narration","");tt=sj.get("thumbnail_text",ti)
+        iq=sj.get("image_queries",["Korea","Seoul"])
+        notify(f"ğŸ“ {ti}")
+        au=tts(na,sid);notify("ğŸ™ï¸ TTS done")
+        im2=imgs(iq,sid);notify(f"ğŸ–¼ï¸ {len(im2)} imgs")
+        th=thumb(tt,im2[0] if im2 else "",sid);notify("ğŸ¨ thumb")
+        vd=video(im2,au,na,sid)
+        sz=vd.stat().st_size/(1024*1024) if vd.exists() else 0
+        notify(f"â€ñˆù½¹”„ğ½ˆùq¹íÑ¥õq¹íÍèè¸Å™õ5ˆ¤(€€€€€€€É•ÑÕÉ¸ì‰ÍÑ…ÑÕÌˆè‰ÍÕ•ÍÌˆ°‰Ñ¥Ñ±”ˆéÑ¤°‰Ù¥‘•¼ˆéÍÑÈ¡Ù¤°‰Í¥é•}µˆˆéÉ½Õ¹¡Íè°Ä¥ô(€€€•á•ÁĞá•ÁÑ¥½¸…Ì”è(€€€€€€€0¹•ÉÉ½È¡˜‰ÉÈéí•ôˆ±•á}¥¹™¼õQÉÕ”¤í¹½Ñ¥™ä¡˜‹Šv0íÍÑÈ¡”¥lèÈÀÁuôˆ¤(€€€€€€€É•ÑÕÉ¸ì‰ÍÑ…ÑÕÌˆè‰•ÉÉ½Èˆ°‰•ÉÉ½ÈˆéÍÑÈ¡”¥ô()…ÁÀ¹É½ÕÑ” ˆ¼ˆ¤)‘•˜¡½µ” ¤éÉ•ÑÕÉ¸©Í½¹¥™ä¡ì‰Í•ÉÙ¥”ˆè‰åĞµ…ÕÑ¼µØÌˆ°‰ÉÕ¹¹¥¹œˆéAMl‰ÉÕ¹¹¥¹œ‰uô¤)…ÁÀ¹É½ÕÑ” ˆ½¡•…±Ñ ˆ¤)‘•˜¡•…±Ñ  ¤éÉ•ÑÕÉ¸©Í½¹¥™ä¡ì‰ÍÑ…ÑÕÌˆè‰½¬ˆ°‰ÑÌˆé‘…Ñ•Ñ¥µ”¹¹½Ü ¤¹¥Í½™½Éµ…Ğ ¥ô¤)…ÁÀ¹É½ÕÑ” ˆ½ÑÉ¥•Èˆ±µ•Ñ¡½‘Ìõl‰A=MP‰t¤)‘•˜ÑÉ¥•È ¤è(€€€¥˜AMl‰ÉÕ¹¹¥¹œ‰téÉ•ÑÕÉ¸©Í½¹¥™ä¡ì‰ÍÑ…ÑÕÌˆè‰‰ÕÍä‰ô¤°ĞÈä(€€€õÉ•ÅÕ•ÍĞ¹©Í½¸½ÈíôíÌõ¹•Ğ ‰ÍÉ¥ÁĞˆ±¤(€€€Ñ¡É•…‘¥¹œ¹Q¡É•…¡Ñ…É•Ğõ}È±…ÉÌô¡Ì°¤¤¹ÍÑ…ÉĞ ¤(€€€É•ÑÕÉ¸©Í½¹¥™ä¡ì‰ÍÑ…ÑÕÌˆè‰ÍÑ…ÉÑ•ˆ°‰ÑÌˆé‘…Ñ•Ñ¥µ”¹¹½Ü ¤¹¥Í½™½Éµ…Ğ ¥ô¤)…ÁÀ¹É½ÕÑ” ˆ½ÍÑ…ÑÕÌˆ¤)‘•˜ÍÑ…ÑÕÌ ¤éÉ•ÑÕÉ¸©Í½¹¥™ä¡AL¤)‘•˜}È¡Ì¤è(€€€AMl‰ÉÕ¹¹¥¹œ‰tõQÉÕ”íAMl‰±…ÍÑ}ÉÕ¸‰tõ‘…Ñ•Ñ¥µ”¹¹½Ü ¤¹¥Í½™½Éµ…Ğ ¤(€€€ÑÉäéAMl‰±…ÍÑ}É•ÍÕ±Ğ‰tõÁ¥Á•±¥¹”¡Ì¤(€€€•á•ÁĞá•ÁÑ¥½¸…Ì”éAMl‰±…ÍÑ}É•ÍÕ±Ğ‰tõì‰ÍÑ…ÑÕÌˆè‰•ÉÉ½Èˆ°‰•ÉÉ½ÈˆéÍÑÈ¡”¥ô(€€€™¥¹…±±äéAMl‰ÉÕ¹¹¥¹œ‰tõ…±Í”()¥˜}}¹…µ•}|ôô‰}}µ…¥¹}|ˆè(€€€Àõ¥¹Ğ¡½Ì¹•Ñ•¹Ø ‰A=IPˆ°ÄÀÀÀÀ¤¤í0¹¥¹™¼¡˜‹Â~:°ØÌéíÁôˆ¤(€€€…ÁÀ¹ÉÕ¸¡¡½ÍĞôˆÀ¸À¸À¸Àˆ±Á½ÉĞõÀ¤(
